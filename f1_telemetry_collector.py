@@ -162,6 +162,13 @@ class F1TelemetryCollector:
             'penalties_time', 'num_penalties', 'num_tyre_stints',
         ])
 
+        self._create_csv('participants',timestamp,[
+            'timestamp', 'session_uid', 'frame','car_index',
+            'ai_controlled', 'driver_id', 'network_id', 'team_id', 'my_team',
+            'race_number', 'nationality', 'name', 'your_telemetry', 'show_online_names',
+            'tech_level', 'platform'
+        ])
+
         # 初始化所有数据类型的上次收集时间
         for key in self.csv_writers.keys():
             self.last_collection_time[key] = 0
@@ -424,7 +431,7 @@ class F1TelemetryCollector:
 
             motion_ex_data = struct.unpack(motion_ex_format, data[offset:offset + motion_ex_size])
 
-            row = [timestamp, header['session_uid'], header['frame_identifier']] + list(motion_ex_data)
+            row = [timestamp, header['session_uid'], header['frame_identifier']] + list(motion_ex_data[:47])
             self.csv_writers['motion_ex'].writerow(row)
         except (struct.error, IndexError) as e:
             print(f"解析Motion Ex数据错误: {e}")
@@ -435,11 +442,11 @@ class F1TelemetryCollector:
             return
         
         timestamp = time.time()
-        offset = 29
+        offset = 30
         
         try:
             for car_idx in range(MAX_CARS):
-                car_format = '<IIHBHBHBHBfffBBBBBBBBBBBBBBBHHBfB'
+                car_format = '<BBBBBBBIdBBBBBBBBBBBBBBBBBBBBBBBBBBB'
                 car_size = struct.calcsize(car_format)
                 if offset + car_size > len(data):
                     break
@@ -457,6 +464,46 @@ class F1TelemetryCollector:
         except (struct.error, IndexError) as e:
             print(f"解析Final Classification数据错误: {e}")
 
+    def _parse_participants_packet(self, data, header):
+        """解析Participants数据包"""
+        if not self._should_collect('participants'):
+            return
+
+        timestamp = time.time()
+        offset = 30  # Header size
+
+        try:
+            if len(data) < offset + 1:
+                return
+
+            m_numActiveCars = struct.unpack_from('<B', data, offset)[0]
+            offset += 1
+
+            participant_format = '<BBBBBBB32sBBHBBBBBBBBBBBBBB'  # up to m_numColours
+            participant_size = struct.calcsize(participant_format)
+
+            for car_idx in range(MAX_CARS):
+                if offset + participant_size > len(data):
+                    break
+
+                participant_data = struct.unpack_from(participant_format, data, offset)
+                offset += participant_size
+                
+                # Clean and decode m_name field
+                m_name = participant_data[7].split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+
+                row = [
+                    timestamp,header['session_uid'],header['frame_identifier'],car_idx,
+                    participant_data[0],participant_data[1],participant_data[2],participant_data[3],#ai_controlled, driver_id, network_id, team_id
+                    participant_data[4],participant_data[5],participant_data[6],m_name,#my_team, race_number, nationality, name
+                    participant_data[8],participant_data[9],participant_data[10],participant_data[11]#your_telemetry, show_online_names, tech_level, platform
+                ]
+
+                self.csv_writers['participants'].writerow(row)
+
+        except (struct.error, IndexError, UnicodeDecodeError) as e:
+            print(f"解析Participants数据错误: {e}")
+    
     def process_packet(self, data):
         """处理接收到的数据包"""
         try:
@@ -488,6 +535,10 @@ class F1TelemetryCollector:
                 self._parse_car_setups_packet(data, header)
             elif packet_id == PacketID.MOTION_EX:
                 self._parse_motion_ex_packet(data, header)
+            elif packet_id == PacketID.FINAL_CLASSIFICATION:
+                self._parse_final_classification_packet(data, header)
+            elif packet_id == PacketID.PARTICIPANTS:
+                self._parse_participants_packet(data, header)
 
         except Exception as e:
             print(f"处理数据包时出错: {e}")
