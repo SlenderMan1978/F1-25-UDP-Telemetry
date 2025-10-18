@@ -11,7 +11,7 @@ F1 25 游戏 → UDP 数据流 → CSV 文件 → INI 配置文件 → Race Simu
 ## 安装依赖
 
 ```bash
-pip install -r requirement.txt
+pip install -r requirements.txt
 ```
 
 ## 使用方法
