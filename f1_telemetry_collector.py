@@ -98,7 +98,7 @@ class F1TelemetryCollector:
             'actual_tyre_compound', 'visual_tyre_compound', 'tyres_age_laps',
             'vehicle_fia_flags', 'engine_power_ice', 'engine_power_mguk',
             'ers_store_energy', 'ers_deploy_mode', 'ers_harvested_mguk',
-            'ers_harvested_mguh', 'ers_deployed_this_lap'
+            'ers_harvested_mguh', 'ers_deployed_this_lap','network_paused'
         ])
 
         # Car Damage数据
@@ -106,6 +106,7 @@ class F1TelemetryCollector:
             'timestamp', 'session_uid', 'frame', 'car_index',
             'tyre_wear_rl', 'tyre_wear_rr', 'tyre_wear_fl', 'tyre_wear_fr',
             'tyre_damage_rl', 'tyre_damage_rr', 'tyre_damage_fl', 'tyre_damage_fr',
+            'tyre_blister_rl', 'tyre_blister_rr', 'tyre_blister_fl', 'tyre_blister_fr',
             'brake_damage_rl', 'brake_damage_rr', 'brake_damage_fl', 'brake_damage_fr',
             'front_left_wing_damage', 'front_right_wing_damage', 'rear_wing_damage',
             'floor_damage', 'diffuser_damage', 'sidepod_damage',
@@ -154,6 +155,7 @@ class F1TelemetryCollector:
             'wheel_vert_force_fl', 'wheel_vert_force_fr'
         ])
 
+        # final_classification 数据
         self._create_csv('final_classification',timestamp,[
             'timestamp', 'session_uid', 'frame','car_index',
             'position', 'num_laps', 'grid_position', 'points', 'num_pit_stops',
@@ -162,6 +164,7 @@ class F1TelemetryCollector:
             'penalties_time', 'num_penalties', 'num_tyre_stints',
         ])
 
+        # participants 数据
         self._create_csv('participants',timestamp,[
             'timestamp', 'session_uid', 'frame','car_index',
             'ai_controlled', 'driver_id', 'network_id', 'team_id', 'my_team',
@@ -470,7 +473,7 @@ class F1TelemetryCollector:
             return
 
         timestamp = time.time()
-        offset = 30  # Header size
+        offset = 29  # Header size
 
         try:
             if len(data) < offset + 1:
