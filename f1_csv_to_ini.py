@@ -1,6 +1,7 @@
 """
-F1 25 CSV Telemetry Data to INI Converter
+F1 25 CSV Telemetry Data to INI Converter (Enhanced)
 将F1 25游戏收集的CSV遥测数据转换为race simulation所需的.ini格式
+包含完整的track_pars, MONTE_CARLO_PARS, EVENT_PARS和VSE_PARS
 """
 
 import pandas as pd
@@ -46,7 +47,7 @@ TRACK_ID_MAP = {
     29: "Jeddah", 30: "Miami", 31: "LasVegas", 32: "Losail"
 }
 
-# Driver ID映射表 (来自F1 25 UDP规范)
+# Driver ID映射表
 DRIVER_ID_MAP = {
     0: "Carlos Sainz", 2: "Daniel Ricciardo", 3: "Fernando Alonso",
     4: "Felipe Massa", 7: "Lewis Hamilton", 9: "Max Verstappen",
@@ -86,6 +87,10 @@ class F1DataConverter:
         self.participants = {}
         self.driver_lap_times = defaultdict(list)
         self.tyre_degradation_data = defaultdict(lambda: defaultdict(list))
+        self.pit_stop_data = defaultdict(list)
+        self.fcy_phases = []
+        self.retirements = []
+        self.driver_strategies = defaultdict(list)
 
     def load_csv_files(self):
         """加载所有CSV文件"""
@@ -145,11 +150,10 @@ class F1DataConverter:
             team_id = int(car_data.get('team_id', 255))
             driver_id = int(car_data.get('driver_id', 255))
 
-            # 跳过无效的车辆索引 - driver_id或team_id为255的都忽略
+            # 跳过无效的车辆索引
             if team_id == 255 or driver_id == 255:
                 continue
 
-            # 使用driver_id映射获取driver姓名
             driver_name = DRIVER_ID_MAP.get(driver_id, f'Driver_{car_idx}')
 
             participants[int(car_idx)] = {
@@ -177,7 +181,7 @@ class F1DataConverter:
         for car_idx in lap_data_df['car_index'].unique():
             car_laps = lap_data_df[lap_data_df['car_index'] == car_idx]
 
-            # 提取有效圈速 (last_lap_time_ms > 0 且 current_lap_invalid == 0)
+            # 提取有效圈速
             valid_laps = car_laps[
                 (car_laps['last_lap_time_ms'] > 0) &
                 (car_laps['current_lap_invalid'] == 0)
@@ -190,6 +194,176 @@ class F1DataConverter:
                     'lap_time_s': lap['last_lap_time_ms'] / 1000.0
                 })
 
+    def analyze_pit_stops(self, lap_data_df):
+        """分析进站数据 - 用于计算进出站时间损失"""
+        if lap_data_df is None or len(lap_data_df) == 0:
+            return
+
+        print("\n分析进站数据...")
+
+        for car_idx in lap_data_df['car_index'].unique():
+            car_data = lap_data_df[lap_data_df['car_index'] == car_idx].copy()
+            car_data = car_data.sort_values('current_lap_num')
+
+            # 检测进站：pit_status从0变为非0
+            car_data['pit_entry'] = (car_data['pit_status'] > 0) & (car_data['pit_status'].shift(1) == 0)
+            car_data['pit_exit'] = (car_data['pit_status'] == 0) & (car_data['pit_status'].shift(1) > 0)
+
+            pit_entries = car_data[car_data['pit_entry']]
+            pit_exits = car_data[car_data['pit_exit']]
+
+            for _, entry in pit_entries.iterrows():
+                lap_num = int(entry['current_lap_num'])
+
+                # 查找对应的出站
+                exit_lap = pit_exits[pit_exits['current_lap_num'] >= lap_num]
+                if len(exit_lap) > 0:
+                    exit_lap = exit_lap.iloc[0]
+
+                    # 计算进出站时间损失（相对于正常圈速）
+                    normal_lap_times = car_data[
+                        (car_data['last_lap_time_ms'] > 0) &
+                        (car_data['pit_status'] == 0) &
+                        (car_data['current_lap_invalid'] == 0)
+                    ]['last_lap_time_ms']
+
+                    if len(normal_lap_times) > 0:
+                        avg_normal_lap = normal_lap_times.median() / 1000.0
+                        inlap_time = entry['last_lap_time_ms'] / 1000.0 if entry['last_lap_time_ms'] > 0 else avg_normal_lap
+                        outlap_time = exit_lap['last_lap_time_ms'] / 1000.0 if exit_lap['last_lap_time_ms'] > 0 else avg_normal_lap
+
+                        self.pit_stop_data[car_idx].append({
+                            'lap_num': lap_num,
+                            'inlap_loss': max(0, inlap_time - avg_normal_lap),
+                            'outlap_loss': max(0, outlap_time - avg_normal_lap)
+                        })
+
+        # 打印统计
+        total_stops = sum(len(stops) for stops in self.pit_stop_data.values())
+        print(f"  找到 {total_stops} 次进站")
+
+    def analyze_fcy_phases(self, session_df, lap_data_df):
+        """分析FCY（安全车/VSC）阶段"""
+        if session_df is None or len(session_df) == 0:
+            return
+
+        print("\n分析FCY阶段...")
+
+        session_df = session_df.copy()
+        session_df = session_df.sort_values('timestamp')
+
+        # 检测安全车状态变化 (0=无, 1=全场, 2=虚拟, 3=编队圈)
+        session_df['sc_change'] = session_df['safety_car_status'].ne(session_df['safety_car_status'].shift())
+
+        fcy_start = None
+        fcy_type = None
+
+        for _, row in session_df[session_df['sc_change']].iterrows():
+            sc_status = int(row['safety_car_status'])
+
+            if sc_status in [1, 2] and fcy_start is None:  # FCY开始
+                fcy_start = row['timestamp']
+                fcy_type = "SC" if sc_status == 1 else "VSC"
+
+            elif sc_status == 0 and fcy_start is not None:  # FCY结束
+                self.fcy_phases.append({
+                    'start_time': fcy_start,
+                    'end_time': row['timestamp'],
+                    'type': fcy_type,
+                    'duration': row['timestamp'] - fcy_start
+                })
+                fcy_start = None
+                fcy_type = None
+
+        print(f"  找到 {len(self.fcy_phases)} 个FCY阶段")
+        for phase in self.fcy_phases:
+            print(f"    {phase['type']}: {phase['start_time']:.1f}s - {phase['end_time']:.1f}s")
+
+    def analyze_retirements(self, lap_data_df):
+        """分析车手退赛"""
+        if lap_data_df is None or len(lap_data_df) == 0:
+            return
+
+        print("\n分析退赛情况...")
+
+        for car_idx in lap_data_df['car_index'].unique():
+            car_data = lap_data_df[lap_data_df['car_index'] == car_idx].copy()
+            car_data = car_data.sort_values('current_lap_num')
+
+            # 检测退赛：driver_status变为3或4 (3=retired, 4=dnf)
+            retirements = car_data[
+                (car_data['driver_status'].isin([3, 4])) &
+                (~car_data['driver_status'].shift(1).isin([3, 4]))
+            ]
+
+            if len(retirements) > 0:
+                retirement = retirements.iloc[0]
+                self.retirements.append({
+                    'car_index': car_idx,
+                    'lap_num': float(retirement['current_lap_num']),
+                    'timestamp': retirement['timestamp']
+                })
+
+        print(f"  找到 {len(self.retirements)} 次退赛")
+        for ret in self.retirements:
+            initials = self._get_driver_initials(ret['car_index'])
+            print(f"    {initials}: 第{ret['lap_num']:.1f}圈")
+
+    def analyze_strategies(self, lap_data_df, car_status_df):
+        """分析车手策略（轮胎选择和进站圈数）"""
+        if lap_data_df is None or car_status_df is None:
+            return
+
+        print("\n分析比赛策略...")
+
+        lap_data_df = lap_data_df.copy()
+        car_status_df = car_status_df.copy()
+
+        lap_data_df['timestamp'] = lap_data_df['timestamp'].astype(float).round(3)
+        car_status_df['timestamp'] = car_status_df['timestamp'].astype(float).round(3)
+
+        merged = pd.merge_asof(
+            lap_data_df,
+            car_status_df[['timestamp', 'car_index', 'actual_tyre_compound', 'tyres_age_laps']],
+            on='timestamp',
+            by='car_index',
+            direction='nearest',
+            tolerance=1
+        )
+
+        for car_idx in merged['car_index'].unique():
+            car_data = merged[merged['car_index'] == car_idx].copy()
+            car_data = car_data.sort_values('current_lap_num')
+            car_data = car_data[car_data['actual_tyre_compound'].notna()]
+
+            if len(car_data) == 0:
+                continue
+
+            # 检测轮胎更换
+            car_data['tyre_change'] = (
+                car_data['actual_tyre_compound'].ne(car_data['actual_tyre_compound'].shift()) |
+                (car_data['tyres_age_laps'] < car_data['tyres_age_laps'].shift())
+            )
+
+            strategy = []
+            for idx, row in car_data[car_data['tyre_change']].iterrows():
+                compound_id = int(row['actual_tyre_compound'])
+                compound = TYRE_COMPOUND_MAP.get(compound_id, f"C{compound_id}")
+
+                # 转换为A系列命名
+                if compound.startswith('C') and len(compound) == 2:
+                    compound = f"A{compound[1]}"
+
+                lap_num = int(row['current_lap_num']) - 1 if row['current_lap_num'] > 0 else 0
+                tyre_age = int(row['tyres_age_laps'])
+
+                strategy.append([lap_num, compound, tyre_age, 0.0])
+
+            if strategy:
+                self.driver_strategies[car_idx] = strategy
+
+        print(f"  分析了 {len(self.driver_strategies)} 位车手的策略")
+
     def analyze_tyre_degradation(self, lap_data_df, car_status_df, telemetry_df):
         """分析轮胎降解数据"""
         if lap_data_df is None or car_status_df is None:
@@ -197,7 +371,6 @@ class F1DataConverter:
 
         print("\n分析轮胎降解数据...")
 
-        # 确保timestamp和car_index类型一致
         lap_data_df = lap_data_df.copy()
         car_status_df = car_status_df.copy()
 
@@ -206,7 +379,6 @@ class F1DataConverter:
         lap_data_df['car_index'] = lap_data_df['car_index'].astype(int)
         car_status_df['car_index'] = car_status_df['car_index'].astype(int)
 
-        # 合并数据 - 使用nearest时间匹配
         merged = pd.merge_asof(
             lap_data_df,
             car_status_df[['timestamp', 'car_index', 'actual_tyre_compound', 'tyres_age_laps']],
@@ -222,14 +394,11 @@ class F1DataConverter:
         for car_idx in merged['car_index'].unique():
             car_data = merged[merged['car_index'] == car_idx].copy()
             car_data = car_data.sort_values('current_lap_num')
-
-            # 只保留有轮胎数据的行
             car_data = car_data[car_data['actual_tyre_compound'].notna()]
 
             if len(car_data) == 0:
                 continue
 
-            # 按轮胎stint分组
             car_data['tyre_stint'] = (
                 car_data['actual_tyre_compound'].ne(car_data['actual_tyre_compound'].shift()) |
                 (car_data['tyres_age_laps'] < car_data['tyres_age_laps'].shift())
@@ -238,13 +407,12 @@ class F1DataConverter:
             for stint_id in car_data['tyre_stint'].unique():
                 stint_data = car_data[car_data['tyre_stint'] == stint_id]
 
-                if len(stint_data) < 3:  # 至少需要3个数据点
+                if len(stint_data) < 3:
                     continue
 
                 compound = int(stint_data['actual_tyre_compound'].iloc[0])
                 compound_name = TYRE_COMPOUND_MAP.get(compound, f"Unknown_{compound}")
 
-                # 提取圈速和轮胎年龄
                 valid_data = stint_data[
                     (stint_data['last_lap_time_ms'] > 0) &
                     (stint_data['current_lap_invalid'] == 0)
@@ -260,7 +428,6 @@ class F1DataConverter:
                         'lap_num': int(row['current_lap_num'])
                     })
 
-        # 打印统计信息
         total_stints = sum(len(compounds) for compounds in self.tyre_degradation_data.values())
         print(f"  找到 {total_stints} 个轮胎stint用于分析")
         for car_idx, compounds in self.tyre_degradation_data.items():
@@ -273,11 +440,10 @@ class F1DataConverter:
         if len(tyre_data) < 3:
             return None
 
-        # 提取数据
         ages = np.array([d['tyre_age'] for d in tyre_data])
         lap_times = np.array([d['lap_time_s'] for d in tyre_data])
 
-        # 移除异常值 (使用IQR方法)
+        # 移除异常值
         q1, q3 = np.percentile(lap_times, [25, 75])
         iqr = q3 - q1
         lower_bound = q1 - 1.5 * iqr
@@ -291,15 +457,11 @@ class F1DataConverter:
             return None
 
         try:
-            # 线性拟合: lap_time = k_0 + k_1_lin * age
             slope, intercept, r_value, _, _ = stats.linregress(ages, lap_times)
-
-            # 计算基准圈速 (新轮胎)
             baseline = lap_times.min()
             k_0 = intercept - baseline
             k_1_lin = slope
 
-            # 二次拟合: lap_time = k_0 + k_1_quad * age + k_2_quad * age^2
             def quad_func(x, k0, k1, k2):
                 return baseline + k0 + k1 * x + k2 * x**2
 
@@ -332,7 +494,6 @@ class F1DataConverter:
 
         print("\n计算赛道参数...")
 
-        # 找到最快圈速 (qualifying lap time)
         valid_laps = lap_data_df[
             (lap_data_df['last_lap_time_ms'] > 0) &
             (lap_data_df['current_lap_invalid'] == 0)
@@ -342,20 +503,22 @@ class F1DataConverter:
             return {}
 
         t_q = valid_laps['last_lap_time_ms'].min() / 1000.0
-
-        # 计算比赛配速差距 (取前10%最快圈速的平均值作为race pace)
         fastest_laps = valid_laps.nsmallest(max(1, len(valid_laps) // 10), 'last_lap_time_ms')
         t_race = fastest_laps['last_lap_time_ms'].mean() / 1000.0
         t_gap_racepace = t_race - t_q
 
-        # 估算其他参数 (基于典型F1赛道)
+        # 计算进出站时间损失
+        pit_stats = self._calculate_pit_drive_times()
+
         track_params = {
             't_q': round(t_q, 3),
             't_gap_racepace': round(max(0.5, t_gap_racepace), 3),
-            't_lap_sens_mass': 0.03,  # 典型值: ~30ms/kg
+            't_lap_sens_mass': 0.03,
             't_pit_tirechange_min': 2.0,
-            't_loss_pergridpos': round(t_q * 0.0015, 3),  # ~0.15% per position
-            't_loss_firstlap': round(t_q * 0.025, 3),  # ~2.5%
+            **pit_stats,  # 添加进出站时间
+            'pits_aft_finishline': True,
+            't_loss_pergridpos': round(t_q * 0.0015, 3),
+            't_loss_firstlap': round(t_q * 0.025, 3),
             't_gap_overtake': 1.2,
             't_gap_overtake_vel': -0.035,
             't_drseffect': -0.5,
@@ -364,6 +527,40 @@ class F1DataConverter:
         }
 
         return track_params
+
+    def _calculate_pit_drive_times(self):
+        """计算进出站时间损失"""
+        if not self.pit_stop_data:
+            # 使用默认值
+            return {
+                't_pitdrive_inlap': 5.0,
+                't_pitdrive_outlap': 15.0,
+                't_pitdrive_inlap_fcy': 2.5,
+                't_pitdrive_outlap_fcy': 12.0,
+                't_pitdrive_inlap_sc': 0.5,
+                't_pitdrive_outlap_sc': 11.0
+            }
+
+        # 计算平均进出站时间损失
+        all_inlap = []
+        all_outlap = []
+
+        for stops in self.pit_stop_data.values():
+            for stop in stops:
+                all_inlap.append(stop['inlap_loss'])
+                all_outlap.append(stop['outlap_loss'])
+
+        avg_inlap = np.median(all_inlap) if all_inlap else 5.0
+        avg_outlap = np.median(all_outlap) if all_outlap else 15.0
+
+        return {
+            't_pitdrive_inlap': round(avg_inlap, 3),
+            't_pitdrive_outlap': round(avg_outlap, 3),
+            't_pitdrive_inlap_fcy': round(avg_inlap * 0.5, 3),
+            't_pitdrive_outlap_fcy': round(avg_outlap * 0.8, 3),
+            't_pitdrive_inlap_sc': round(avg_inlap * 0.1, 3),
+            't_pitdrive_outlap_sc': round(avg_outlap * 0.73, 3)
+        }
 
     def generate_ini_content(self, csv_files):
         """生成完整的INI文件内容"""
@@ -374,6 +571,10 @@ class F1DataConverter:
 
         # 分析数据
         self.analyze_lap_times(csv_files['lap_data'])
+        self.analyze_pit_stops(csv_files['lap_data'])
+        self.analyze_fcy_phases(csv_files['session'], csv_files['lap_data'])
+        self.analyze_retirements(csv_files['lap_data'])
+        self.analyze_strategies(csv_files['lap_data'], csv_files['car_status'])
         self.analyze_tyre_degradation(
             csv_files['lap_data'],
             csv_files['car_status'],
@@ -404,11 +605,11 @@ class F1DataConverter:
             'min_t_dist_sc': 0.8,
             't_duel': 0.3,
             't_overtake_loser': 0.3,
-            'use_drs': 'true',
+            'use_drs': True,
             'drs_window': 1.0,
             'drs_allow_lap': 3,
             'drs_sc_delay': 2,
-            'participants': participant_initials  # 直接使用列表，不转换为字符串
+            'participants': participant_initials
         }
 
         ini_content.append(f'race_pars = {json.dumps(race_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
@@ -419,8 +620,7 @@ class F1DataConverter:
         track_name = session_info.get('track_name', 'Unknown') if session_info else 'Unknown'
         track_pars = {
             'name': track_name,
-            **track_params,
-            'pits_aft_finishline': True
+            **track_params
         }
         ini_content.append(f'track_pars = {json.dumps(track_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
         ini_content.append("")
@@ -443,10 +643,28 @@ class F1DataConverter:
         ini_content.append(f'driver_pars = {json.dumps(driver_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
         ini_content.append("")
 
+        # [MONTE_CARLO_PARS]
+        ini_content.append("[MONTE_CARLO_PARS]")
+        monte_carlo_pars = self._generate_monte_carlo_pars()
+        ini_content.append(f'monte_carlo_pars = {json.dumps(monte_carlo_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
+        ini_content.append("")
+
+        # [EVENT_PARS]
+        ini_content.append("[EVENT_PARS]")
+        event_pars = self._generate_event_pars()
+        ini_content.append(f'event_pars = {json.dumps(event_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
+        ini_content.append("")
+
+        # [VSE_PARS]
+        ini_content.append("[VSE_PARS]")
+        vse_pars = self._generate_vse_pars()
+        ini_content.append(f'vse_pars = {json.dumps(vse_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
+        ini_content.append("")
+
         return '\n'.join(ini_content)
 
     def _get_driver_initials(self, car_idx):
-        """生成车手缩写 - 使用姓氏的前三位字母"""
+        """生成车手缩写"""
         if car_idx not in self.participants:
             return f"DR{car_idx}"
 
@@ -454,10 +672,8 @@ class F1DataConverter:
         parts = name.upper().split()
 
         if len(parts) >= 2:
-            # 使用姓氏（最后一个单词）的前3个字母
             return parts[-1][:3]
         else:
-            # 如果只有一个单词，使用前3个字母
             return parts[0][:3] if parts else f"DR{car_idx}"
 
     def _generate_car_pars(self):
@@ -493,13 +709,12 @@ class F1DataConverter:
         return teams
 
     def _generate_tireset_pars(self):
-        """生成轮胎参数 (含拟合结果)"""
+        """生成轮胎参数"""
         print("\n拟合轮胎降解参数...")
         tireset_pars = {}
 
         if not self.tyre_degradation_data:
             print("  ⚠ 警告: 没有找到轮胎降解数据，使用默认参数")
-            # 为所有参赛者生成默认参数
             for car_idx in self.participants.keys():
                 initials = self._get_driver_initials(car_idx)
                 tireset_pars[initials] = {
@@ -527,7 +742,6 @@ class F1DataConverter:
                     fit_result = self.fit_tyre_degradation(data)
 
                     if fit_result:
-                        # 使用简化的化合物名称 (A3=C3, A4=C4等)
                         if compound.startswith('C'):
                             compound_key = f"A{compound[1]}"
                         else:
@@ -553,7 +767,6 @@ class F1DataConverter:
         for car_idx, participant in self.participants.items():
             initials = self._get_driver_initials(car_idx)
 
-            # 计算平均圈速作为车手能力指标
             lap_times = self.driver_lap_times.get(car_idx, [])
             if lap_times:
                 avg_lap_time = np.mean([lt['lap_time_s'] for lt in lap_times])
@@ -562,13 +775,16 @@ class F1DataConverter:
             else:
                 t_driver = 0.0
 
+            # 使用分析得到的策略或默认策略
+            strategy = self.driver_strategies.get(car_idx, [[0, 'A4', 0, 0.0]])
+
             driver_pars[initials] = {
                 'carno': participant['race_number'],
                 'name': participant['name'],
                 'initials': initials,
                 'team': participant['team'],
                 't_driver': round(max(0, t_driver), 3),
-                'strategy_info': [[0, 'A4', 0, 0.0]],  # 默认策略
+                'strategy_info': strategy,
                 'p_grid': car_idx + 1,
                 't_teamorder': 0.0,
                 'vel_max': 330.0
@@ -576,23 +792,111 @@ class F1DataConverter:
 
         return driver_pars
 
+    def _generate_monte_carlo_pars(self):
+        """生成蒙特卡洛参数"""
+        # 找到最快的车手作为参考
+        fastest_driver = None
+        fastest_time = float('inf')
+
+        for car_idx, lap_times in self.driver_lap_times.items():
+            if lap_times:
+                best_time = min([lt['lap_time_s'] for lt in lap_times])
+                if best_time < fastest_time:
+                    fastest_time = best_time
+                    fastest_driver = car_idx
+
+        ref_driver = self._get_driver_initials(fastest_driver) if fastest_driver else "HAM"
+
+        return {
+            'min_dist_sc': 1.5,
+            'min_dist_vsc': 1.5,
+            'ref_driver': ref_driver
+        }
+
+    def _generate_event_pars(self):
+        """生成事件参数（FCY和退赛）"""
+        # 转换FCY阶段为进度（圈数）
+        fcy_phases = []
+        for phase in self.fcy_phases:
+            # 这里需要将时间戳转换为圈数进度
+            # 简化处理：假设平均圈速
+            fcy_phases.append([
+                0.0,  # start progress (需要根据实际数据计算)
+                0.0,  # end progress
+                phase['type'],
+                None,
+                None
+            ])
+
+        # 转换退赛为进度 - 设置为[]（允许模拟器随机生成）
+        retirements = []  # 设置为[]，让race simulation随机决定
+
+        return {
+            'fcy_data': {
+                'phases': fcy_phases if fcy_phases else [],
+                'domain': 'progress'
+            },
+            'retire_data': {
+                'retirements': retirements,
+                'domain': 'progress'
+            }
+        }
+
+    def _generate_vse_pars(self):
+        """生成虚拟策略工程师参数"""
+        # 收集所有使用过的轮胎配方
+        all_compounds = set()
+        for compounds in self.tyre_degradation_data.values():
+            for compound in compounds.keys():
+                if compound.startswith('C'):
+                    all_compounds.add(f"A{compound[1]}")
+
+        available = sorted(list(all_compounds)) if all_compounds else ["A3", "A4", "A5"]
+        available.extend(["I", "W"])  # 添加雨胎
+
+        # 生成基础策略和实际策略
+        base_strategy = {}
+        real_strategy = {}
+
+        for car_idx in self.participants.keys():
+            initials = self._get_driver_initials(car_idx)
+
+            # 使用分析得到的策略
+            if car_idx in self.driver_strategies:
+                real_strategy[initials] = self.driver_strategies[car_idx]
+                base_strategy[initials] = self.driver_strategies[car_idx]
+            else:
+                # 默认策略
+                default_strat = [[0, 'A4', 0, 0.0], [25, 'A3', 0, 0.0]]
+                base_strategy[initials] = default_strat
+                real_strategy[initials] = default_strat
+
+        # VSE类型（全部使用supervised）
+        vse_type = {initials: 'supervised' for initials in base_strategy.keys()}
+
+        return {
+            'available_compounds': available,
+            'param_dry_compounds': [c for c in available if c.startswith('A')],
+            'location_cat': 2,
+            'base_strategy': base_strategy,
+            'real_strategy': real_strategy,
+            'vse_type': vse_type
+        }
+
     def convert(self, output_filename=None):
         """执行转换"""
         print("=" * 70)
-        print("F1 25 遥测数据转换为INI格式")
+        print("F1 25 遥测数据转换为INI格式（增强版）")
         print("=" * 70)
 
-        # 加载CSV文件
         csv_files = self.load_csv_files()
 
         if not any(df is not None for df in csv_files.values()):
             print("\n错误: 未找到有效的CSV文件!")
             return
 
-        # 生成INI内容
         ini_content = self.generate_ini_content(csv_files)
 
-        # 保存文件
         if output_filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = f"race_pars_{timestamp}.ini"
@@ -603,6 +907,15 @@ class F1DataConverter:
         print(f"\n{'=' * 70}")
         print(f"✓ 转换完成! 输出文件: {output_filename}")
         print(f"{'=' * 70}")
+        print(f"\n已包含的参数:")
+        print(f"  ✓ RACE_PARS (比赛基本参数)")
+        print(f"  ✓ TRACK_PARS (赛道参数，包含进出站时间)")
+        print(f"  ✓ CAR_PARS (车辆参数)")
+        print(f"  ✓ TIRESET_PARS (轮胎降解参数)")
+        print(f"  ✓ DRIVER_PARS (车手参数和策略)")
+        print(f"  ✓ MONTE_CARLO_PARS (蒙特卡洛参数)")
+        print(f"  ✓ EVENT_PARS (FCY阶段和退赛)")
+        print(f"  ✓ VSE_PARS (虚拟策略工程师)")
 
 
 if __name__ == "__main__":
