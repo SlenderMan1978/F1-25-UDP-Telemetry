@@ -290,10 +290,10 @@ class F1DataConverter:
             car_data = lap_data_df[lap_data_df['car_index'] == car_idx].copy()
             car_data = car_data.sort_values('current_lap_num')
 
-            # 检测退赛：driver_status变为3或4 (3=retired, 4=dnf)
+            # 检测退赛：result_status变为7或4 (7=retired, 4=dnf)
             retirements = car_data[
-                (car_data['driver_status'].isin([3, 4])) &
-                (~car_data['driver_status'].shift(1).isin([3, 4]))
+                (car_data['result_status'].isin([4, 7])) &
+                (~car_data['result_status'].shift(1).isin([4, 7]))
             ]
 
             if len(retirements) > 0:
