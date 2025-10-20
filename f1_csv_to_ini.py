@@ -1,7 +1,8 @@
 """
-F1 25 CSV Telemetry Data to INI Converter (Enhanced)
+F1 25 CSV Telemetry Data to INI Converter (Enhanced with Optimal Strategy)
 将F1 25游戏收集的CSV遥测数据转换为race simulation所需的.ini格式
 包含完整的track_pars, MONTE_CARLO_PARS, EVENT_PARS和VSE_PARS
+新增：理论最优换胎策略计算
 """
 
 import pandas as pd
@@ -562,11 +563,147 @@ class F1DataConverter:
             't_pitdrive_outlap_sc': round(avg_outlap * 0.73, 3)
         }
 
+    def _calculate_optimal_strategy(self, initials, total_laps, available_compounds, tireset_pars):
+        """计算理论最优换胎策略（最小化总比赛时间）"""
+        if initials not in tireset_pars or not available_compounds:
+            # 返回默认2停策略
+            return [[0, 'A4', 0, 0.0], [int(total_laps * 0.35), 'A3', 0, 0.0], [int(total_laps * 0.7), 'A4', 0, 0.0]]
+
+        driver_tyre_pars = tireset_pars[initials]
+        dry_compounds = [c for c in available_compounds if c.startswith('A')]
+
+        if not dry_compounds:
+            return [[0, 'A4', 0, 0.0]]
+
+        # 获取每种轮胎的降解参数
+        compound_params = {}
+        for compound in dry_compounds:
+            if compound in driver_tyre_pars:
+                params = driver_tyre_pars[compound]
+                compound_params[compound] = {
+                    'k_0': params.get('k_0', 0.0),
+                    'k_1_lin': params.get('k_1_lin', 0.08)
+                }
+
+        if not compound_params:
+            return [[0, 'A4', 0, 0.0]]
+
+        # 计算不同换胎策略的总时间
+        # 假设进站损失：inlap + 换胎 + outlap ≈ 22-25秒
+        PIT_STOP_TIME_LOSS = 23.0  # 秒
+
+        # 尝试1停、2停、3停策略
+        best_strategy = None
+        best_time = float('inf')
+
+        # 按降解率排序轮胎（从硬到软）
+        sorted_compounds = sorted(compound_params.items(),
+                                 key=lambda x: x[1]['k_1_lin'])
+
+        for num_stops in range(1, 4):  # 1停、2停、3停
+            # 尝试不同的进站时机和轮胎组合
+            if num_stops == 1:
+                # 1停策略：使用两种轮胎
+                for start_compound in dry_compounds:
+                    for second_compound in dry_compounds:
+                        for pit_lap in range(int(total_laps * 0.3), int(total_laps * 0.7), 2):
+                            total_time = self._calculate_strategy_time(
+                                [[0, start_compound, 0, 0.0], [pit_lap, second_compound, 0, 0.0]],
+                                total_laps, compound_params, PIT_STOP_TIME_LOSS
+                            )
+                            if total_time < best_time:
+                                best_time = total_time
+                                best_strategy = [[0, start_compound, 0, 0.0], [pit_lap, second_compound, 0, 0.0]]
+
+            elif num_stops == 2:
+                # 2停策略：使用三种轮胎
+                for start_compound in dry_compounds:
+                    for mid_compound in dry_compounds:
+                        for end_compound in dry_compounds:
+                            for pit1 in range(int(total_laps * 0.25), int(total_laps * 0.45), 3):
+                                for pit2 in range(int(total_laps * 0.55), int(total_laps * 0.75), 3):
+                                    if pit2 > pit1 + 5:  # 确保两次进站间隔
+                                        total_time = self._calculate_strategy_time(
+                                            [[0, start_compound, 0, 0.0],
+                                             [pit1, mid_compound, 0, 0.0],
+                                             [pit2, end_compound, 0, 0.0]],
+                                            total_laps, compound_params, PIT_STOP_TIME_LOSS
+                                        )
+                                        if total_time < best_time:
+                                            best_time = total_time
+                                            best_strategy = [[0, start_compound, 0, 0.0],
+                                                           [pit1, mid_compound, 0, 0.0],
+                                                           [pit2, end_compound, 0, 0.0]]
+
+            elif num_stops == 3:
+                # 3停策略：使用多种轮胎
+                if len(sorted_compounds) >= 3:
+                    # 使用最硬、中等、最软的组合
+                    hard = sorted_compounds[0][0]
+                    medium = sorted_compounds[len(sorted_compounds)//2][0]
+                    soft = sorted_compounds[-1][0]
+
+                    pit1 = int(total_laps * 0.2)
+                    pit2 = int(total_laps * 0.45)
+                    pit3 = int(total_laps * 0.7)
+
+                    strategy = [[0, medium, 0, 0.0],
+                               [pit1, hard, 0, 0.0],
+                               [pit2, soft, 0, 0.0],
+                               [pit3, soft, 0, 0.0]]
+
+                    total_time = self._calculate_strategy_time(
+                        strategy, total_laps, compound_params, PIT_STOP_TIME_LOSS
+                    )
+                    if total_time < best_time:
+                        best_time = total_time
+                        best_strategy = strategy
+
+        return best_strategy if best_strategy else [[0, 'A4', 0, 0.0]]
+
+    def _calculate_strategy_time(self, strategy, total_laps, compound_params, pit_stop_loss):
+        """计算策略的总时间（考虑轮胎降解和进站损失）"""
+        total_time = 0.0
+        pit_stops = len(strategy) - 1
+
+        for i in range(len(strategy)):
+            stint_start_lap = strategy[i][0]
+            compound = strategy[i][1]
+
+            # 计算stint结束圈
+            if i < len(strategy) - 1:
+                stint_end_lap = strategy[i + 1][0]
+            else:
+                stint_end_lap = total_laps
+
+            stint_laps = stint_end_lap - stint_start_lap
+
+            # 检查化合物参数是否存在
+            if compound not in compound_params:
+                # 使用平均值
+                k_0 = 0.2
+                k_1_lin = 0.08
+            else:
+                k_0 = compound_params[compound]['k_0']
+                k_1_lin = compound_params[compound]['k_1_lin']
+
+            # 计算这个stint的总时间（线性降解模型）
+            # 每圈时间 = base_lap_time + k_0 + k_1_lin * tyre_age
+            for lap in range(stint_laps):
+                tyre_age = lap
+                lap_time_delta = k_0 + k_1_lin * tyre_age
+                total_time += lap_time_delta
+
+        # 加上进站时间损失
+        total_time += pit_stops * pit_stop_loss
+
+        return total_time
+
     def generate_ini_content(self, csv_files):
         """生成完整的INI文件内容"""
 
         # 提取基本信息
-        session_info = self.extract_session_info(csv_files['session'])
+        self.session_data = self.extract_session_info(csv_files['session'])
         self.participants = self.extract_participants_info(csv_files['participants'])
 
         # 分析数据
@@ -600,7 +737,7 @@ class F1DataConverter:
 
         race_pars = {
             'season': 2025,
-            'tot_no_laps': session_info.get('total_laps', 50) if session_info else 50,
+            'tot_no_laps': self.session_data.get('total_laps', 50) if self.session_data else 50,
             'min_t_dist': 0.5,
             'min_t_dist_sc': 0.8,
             't_duel': 0.3,
@@ -617,7 +754,7 @@ class F1DataConverter:
 
         # [TRACK_PARS]
         ini_content.append("[TRACK_PARS]")
-        track_name = session_info.get('track_name', 'Unknown') if session_info else 'Unknown'
+        track_name = self.session_data.get('track_name', 'Unknown') if self.session_data else 'Unknown'
         track_pars = {
             'name': track_name,
             **track_params
@@ -631,7 +768,7 @@ class F1DataConverter:
         ini_content.append(f'car_pars = {json.dumps(car_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
         ini_content.append("")
 
-        # [TIRESET_PARS]
+        # [TIRESET_PARS] - 必须在VSE_PARS之前生成
         ini_content.append("[TIRESET_PARS]")
         tireset_pars = self._generate_tireset_pars()
         ini_content.append(f'tireset_pars = {json.dumps(tireset_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
@@ -655,9 +792,9 @@ class F1DataConverter:
         ini_content.append(f'event_pars = {json.dumps(event_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
         ini_content.append("")
 
-        # [VSE_PARS]
+        # [VSE_PARS] - 使用tireset_pars来计算最优策略
         ini_content.append("[VSE_PARS]")
-        vse_pars = self._generate_vse_pars()
+        vse_pars = self._generate_vse_pars_with_optimization(tireset_pars)
         ini_content.append(f'vse_pars = {json.dumps(vse_pars, indent=4, cls=NumpyEncoder, ensure_ascii=False)}')
         ini_content.append("")
 
@@ -842,8 +979,8 @@ class F1DataConverter:
             }
         }
 
-    def _generate_vse_pars(self):
-        """生成虚拟策略工程师参数"""
+    def _generate_vse_pars_with_optimization(self, tireset_pars):
+        """生成虚拟策略工程师参数（使用优化的base_strategy）"""
         # 收集所有使用过的轮胎配方
         all_compounds = set()
         for compounds in self.tyre_degradation_data.values():
@@ -853,30 +990,46 @@ class F1DataConverter:
 
         available = sorted(list(all_compounds)) if all_compounds else ["A3", "A4", "A5"]
         available.extend(["I", "W"])  # 添加雨胎
+        dry_compounds = [c for c in available if c.startswith('A')]
+
+        # 获取总圈数
+        total_laps = self.session_data.get('total_laps', 50) if self.session_data else 50
 
         # 生成基础策略和实际策略
         base_strategy = {}
         real_strategy = {}
 
+        print("\n计算理论最优策略...")
+
         for car_idx in self.participants.keys():
             initials = self._get_driver_initials(car_idx)
 
-            # 使用分析得到的策略
+            # 实际策略：使用分析得到的策略
             if car_idx in self.driver_strategies:
                 real_strategy[initials] = self.driver_strategies[car_idx]
-                base_strategy[initials] = self.driver_strategies[car_idx]
             else:
                 # 默认策略
-                default_strat = [[0, 'A4', 0, 0.0], [25, 'A3', 0, 0.0]]
-                base_strategy[initials] = default_strat
+                default_strat = [[0, 'A4', 0, 0.0], [int(total_laps * 0.5), 'A3', 0, 0.0]]
                 real_strategy[initials] = default_strat
+
+            # 基础策略：计算理论最优策略
+            optimal_strategy = self._calculate_optimal_strategy(
+                initials, total_laps, dry_compounds, tireset_pars
+            )
+            base_strategy[initials] = optimal_strategy
+
+            # 打印对比
+            print(f"  {initials}:")
+            print(f"    理论最优: {len(optimal_strategy)-1}停 - {' -> '.join([s[1] for s in optimal_strategy])}")
+            if initials in real_strategy:
+                print(f"    实际策略: {len(real_strategy[initials])-1}停 - {' -> '.join([s[1] for s in real_strategy[initials]])}")
 
         # VSE类型（全部使用supervised）
         vse_type = {initials: 'supervised' for initials in base_strategy.keys()}
 
         return {
             'available_compounds': available,
-            'param_dry_compounds': [c for c in available if c.startswith('A')],
+            'param_dry_compounds': dry_compounds,
             'location_cat': 2,
             'base_strategy': base_strategy,
             'real_strategy': real_strategy,
@@ -916,6 +1069,9 @@ class F1DataConverter:
         print(f"  ✓ MONTE_CARLO_PARS (蒙特卡洛参数)")
         print(f"  ✓ EVENT_PARS (FCY阶段和退赛)")
         print(f"  ✓ VSE_PARS (虚拟策略工程师)")
+        print(f"\n新增功能:")
+        print(f"  ✓ base_strategy: 基于轮胎降解模型的理论最优策略")
+        print(f"  ✓ real_strategy: 从遥测数据分析的实际比赛策略")
 
 
 if __name__ == "__main__":
