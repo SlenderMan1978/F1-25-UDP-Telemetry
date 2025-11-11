@@ -28,4 +28,4 @@ def indent_closing_braces(file_path, indent='    '):
     print(f"✅ 已处理完成: {file_path}")
 
 if __name__ == "__main__":
-    indent_closing_braces("pars_Suzuka_2025.ini")
+    indent_closing_braces("race_pars_Suzuka.ini")
