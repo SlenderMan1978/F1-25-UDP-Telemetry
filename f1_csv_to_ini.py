@@ -992,7 +992,10 @@ class F1DataConverter:
         for compounds in self.tyre_degradation_data.values():
             for compound in compounds.keys():
                 if compound.startswith('C'):
-                    all_compounds.add(f"A{compound[1]}")
+                    if int(compound[1]) <= 3:
+                        all_compounds.add(f"A{int(compound[1]) + 1}")
+                    else:
+                        all_compounds.add(f"A{int(compound[1]) + 2}")
 
         available = sorted(list(all_compounds)) if all_compounds else ["A3", "A4", "A5"]
         available.extend(["I", "W"])  # 添加雨胎
