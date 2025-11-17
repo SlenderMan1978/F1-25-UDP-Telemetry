@@ -353,7 +353,10 @@ class F1DataConverter:
 
                 # 转换为A系列命名
                 if compound.startswith('C') and len(compound) == 2:
-                    compound = f"A{compound[1]}"
+                    if int(compound[1])<= 3:
+                        compound = f"A{int(compound[1]) + 1}"
+                    else:
+                        compound = f"A{int(compound[1]) + 2}"
 
                 lap_num = int(row['current_lap_num']) - 1 if row['current_lap_num'] > 0 else 0
                 tyre_age = int(row['tyres_age_laps'])
@@ -880,7 +883,10 @@ class F1DataConverter:
 
                     if fit_result:
                         if compound.startswith('C'):
-                            compound_key = f"A{compound[1]}"
+                            if int(compound[1]) <= 3:
+                                compound_key = f"A{int(compound[1]) + 1}"
+                            else:
+                                compound_key = f"A{int(compound[1]) + 2}"
                         else:
                             compound_key = compound
 
@@ -986,7 +992,10 @@ class F1DataConverter:
         for compounds in self.tyre_degradation_data.values():
             for compound in compounds.keys():
                 if compound.startswith('C'):
-                    all_compounds.add(f"A{compound[1]}")
+                    if int(compound[1]) <= 3:
+                        all_compounds.add(f"A{int(compound[1]) + 1}")
+                    else:
+                        all_compounds.add(f"A{int(compound[1]) + 2}")
 
         available = sorted(list(all_compounds)) if all_compounds else ["A3", "A4", "A5"]
         available.extend(["I", "W"])  # 添加雨胎
@@ -1076,7 +1085,7 @@ class F1DataConverter:
 
 if __name__ == "__main__":
     # 创建转换器实例
-    converter = F1DataConverter(data_dir="f1_telemetry_data")
+    converter = F1DataConverter(data_dir="f1_telemetry_data_Suzuka2")
 
     # 执行转换
     converter.convert()
